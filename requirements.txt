@@ -1,0 +1,17 @@
+# Core AI/ML Frameworks
+# Note: PyTorch must be installed separately first for CUDA support!
+# See the README.md for instructions.
+transformers==4.41.2
+accelerate
+bitsandbytes
+sentencepiece
+
+# Voice Activity Detection (VAD)
+silero
+
+# Text-to-Speech (TTS) Engine
+kokoro
+
+# Audio I/O & Numerical Operations
+sounddevice
+numpy
