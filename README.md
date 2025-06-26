@@ -60,9 +60,8 @@ Go to the official PyTorch website: https://pytorch.org/get-started/locally/
 
 Use the "Get Started" configuration tool to select the correct options for your system (e.g., Stable, Windows/Linux, Pip, Python, your CUDA version).
 
-Copy the generated command and run it in your activated terminal. It will look something like this:
+Copy the generated command and run it in your activated terminal. The following should most probably work:
 
-# EXAMPLE ONLY! USE THE COMMAND FROM THE PYTORCH WEBSITE!
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 Step 4: Install All Other Dependencies
