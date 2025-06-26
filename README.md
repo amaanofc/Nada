@@ -1,5 +1,5 @@
-Athena: A State-of-the-Art, Low-Latency Conversational AI
-This repository contains the full source code for Athena, a highly responsive, real-time, voice-to-voice conversational AI agent. Built using Python, this project demonstrates a sophisticated, multi-threaded architecture designed to minimize latency and provide a natural, fluid conversational experience.
+Nada: A State-of-the-Art, Low-Latency Conversational AI
+This repository contains the full source code for Nada, a highly responsive, real-time, voice-to-voice conversational AI agent. Built using Python, this project demonstrates a sophisticated, multi-threaded architecture designed to minimize latency and provide a natural, fluid conversational experience.
 
 ✨ Key Features
 This agent is more than just a simple script; it's an engine built with several state-of-the-art techniques:
@@ -29,7 +29,7 @@ graph TD
         U[🗣️ User]
     end
 
-    subgraph Athena Agent
+    subgraph Nada Agent
         A[🎤 AudioInputWorker] -->|Audio Data| B[🧠 LLMWorker]
         B -->|Text Stream| C[🔊 TTSWorker]
         C -->|Audio Output| D[📢 Speaker]
@@ -102,7 +102,7 @@ This guide ensures you install the GPU-accelerated version of PyTorch for maximu
 
 Step 1: Clone the Repository
 git clone <your-repo-url>
-cd athena-agent
+cd nada-agent
 
 Step 2: Create and Activate a Virtual Environment
 This keeps your project dependencies isolated.
