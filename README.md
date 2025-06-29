@@ -1,5 +1,5 @@
-Athena: A State-of-the-Art, Low-Latency Conversational AI
-This repository contains the full source code for Athena, a highly responsive, real-time, voice-to-voice conversational AI agent. Built using Python, this project demonstrates a sophisticated, multi-threaded architecture designed to minimize latency and provide a natural, fluid conversational experience.
+Nada: A State-of-the-Art, Low-Latency Conversational AI
+This repository contains the full source code for Nada, a highly responsive, real-time, voice-to-voice conversational AI agent. Built using Python, this project demonstrates a sophisticated, multi-threaded architecture designed to minimize latency and provide a natural, fluid conversational experience.
 
 ✨ Key Features
 This agent is more than just a simple script; it's an engine built with several state-of-the-art techniques:
@@ -21,70 +21,6 @@ This agent is more than just a simple script; it's an engine built with several 
 🏛️ System Architecture
 The agent's performance is achieved through a carefully orchestrated, multi-threaded architecture designed to keep the pipeline full and eliminate blocking operations wherever possible.
 
-High-Level Overview
-At its core, the system is comprised of three independent workers that communicate through queues, allowing for parallel processing of audio input, language model inference, and speech output.
-
-graph TD
-    subgraph User Interaction
-        U[🗣️ User]
-    end
-
-    subgraph Athena Agent
-        A[🎤 AudioInputWorker] -->|Audio Data| B[🧠 LLMWorker]
-        B -->|Text Stream| C[🔊 TTSWorker]
-        C -->|Audio Output| D[📢 Speaker]
-    end
-
-    U -- speaks to --> A
-    D -- speaks to --> U
-
-Worker Deep Dive
-1. AudioInputWorker (The Ears)
-This thread continuously listens to the microphone and uses the silero-vad model to detect human speech. Its key feature is a two-tiered silence detection system for speculative execution.
-
-graph TD
-    subgraph AudioInputWorker
-        A[Listen to Mic] --> B{Speech Detected?};
-        B -- No --> A;
-        B -- Yes --> C[Start Buffering Audio];
-        C --> D{User Still Speaking?};
-        D -- Yes --> C;
-        D -- No --> E{Short Pause? (Speculative Trigger)};
-        E -- Yes --> F[Send Audio to LLM];
-        E -- No --> G{Long Pause? (End of Turn)};
-        G -- Yes --> F;
-        F --> H[Reset State & Listen];
-        G -- No --> D;
-    end
-
-2. LLMWorker (The Brain)
-This thread receives raw audio, performs inference, and manages conversational context.
-
-graph TD
-    subgraph LLMWorker
-        A[Wait for Audio] --> B[Receive Audio from Queue];
-        B --> C[Format Prompt with History];
-        C --> D[Process with Ultravox Model];
-        D --> E{Generate Text Token Stream};
-        E --> F[Send Token Stream to TTSWorker];
-        F --> G[Update Conversation History];
-        G --> A;
-    end
-
-3. TTSWorker (The Voice)
-This is the most complex component, implementing our "Prime & Parallelize" strategy to ensure seamless, low-latency audio playback.
-
-graph TD
-    subgraph TTSWorker - Prime & Parallelize Pipeline
-        A[Receive Text Stream] --> B[Fragment Text into Sentences];
-        B --> C{"Is this the FIRST sentence?"};
-        C -- Yes --> D[<b>BLOCKING</b>: Generate Audio for Sentence #1];
-        D --> E[Start Audio Playback Stream];
-        C -- No --> F[<b>PARALLEL</b>: Generate Audio for Sentence #2, #3...];
-        F --> G[Add Audio to Playback Queue];
-        E --> H{Stream Plays from Queue};
-        H --> I[End of Response];
-    end
 
 📋 Prerequisites
 Hardware: An NVIDIA GPU with CUDA support (e.g., RTX 30-series or newer) is highly recommended for acceptable performance.
@@ -102,7 +38,7 @@ This guide ensures you install the GPU-accelerated version of PyTorch for maximu
 
 Step 1: Clone the Repository
 git clone <your-repo-url>
-cd athena-agent
+cd nada-agent
 
 Step 2: Create and Activate a Virtual Environment
 This keeps your project dependencies isolated.
@@ -124,9 +60,8 @@ Go to the official PyTorch website: https://pytorch.org/get-started/locally/
 
 Use the "Get Started" configuration tool to select the correct options for your system (e.g., Stable, Windows/Linux, Pip, Python, your CUDA version).
 
-Copy the generated command and run it in your activated terminal. It will look something like this:
+Copy the generated command and run it in your activated terminal. The following should most probably work:
 
-# EXAMPLE ONLY! USE THE COMMAND FROM THE PYTORCH WEBSITE!
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 Step 4: Install All Other Dependencies
