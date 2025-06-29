@@ -1,4 +1,4 @@
-# main.py (V57 - The Definitive, Stable Engine)
+# main.py (V58 - Latency-Profiled Engine)
 
 import torch
 import numpy as np
@@ -27,7 +27,7 @@ class AgentConfig:
 
 def trim_silence(audio_chunk, threshold=0.01):
     non_silent_indices = np.where(np.abs(audio_chunk) > threshold)[0]
-    if len(non_silent_indices) == 0: return audio_chunk 
+    if len(non_silent_indices) == 0: return audio_chunk
     return audio_chunk[non_silent_indices[0]:non_silent_indices[-1] + 1]
 
 class TTSWorker:
@@ -42,8 +42,10 @@ class TTSWorker:
         self.llm_stream_queue = queue.Queue()
         self.audio_playback_queue = queue.Queue(maxsize=200)
         self.callback_buffer = np.array([], dtype=np.float32)
-        self.eot_time = None
-        
+        ### PERF MARKER ### - Renamed for clarity
+        self.initial_trigger_time = None
+        self.first_audio_chunk_queued_time = None
+
         self.is_speaking = False
         self.shutdown_event = Event()
         self.playback_complete_event = Event()
@@ -53,11 +55,16 @@ class TTSWorker:
         
     def _warmup(self):
         try:
-            print("[TTS] Warming up engine...")
-            generator = self.pipeline(" ", voice='af_heart', speed=1.2)
-            for _, _, _ in generator: pass
+            print("[TTS] Warming up engine with a full sentence...")
+            # Use a more realistic sentence to ensure all components are initialized.
+            warmup_text = "This is a warm-up sentence to prepare the text-to-speech engine for real-time synthesis."
+            generator = self.pipeline(warmup_text, voice='af_heart', speed=1.2)
+            # Iterate through the generator to complete the synthesis
+            for _, _, _ in generator:
+                pass
             print("[TTS] Warm-up complete.", file=sys.stderr)
-        except Exception as e: print(f"[TTS] Warm-up failed: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[TTS] Warm-up failed: {e}", file=sys.stderr)
     
     def play(self, item): self.llm_stream_queue.put(item)
     def stop(self): self.shutdown_event.set(); self.interrupt()
@@ -80,24 +87,37 @@ class TTSWorker:
         while len(self.callback_buffer) < chunk_size:
             try:
                 item = self.audio_playback_queue.get_nowait()
-                if item is None:
+                if isinstance(item, tuple):
+                    audio_chunk, queued_time = item
+                    ### PERF MARKER ### - Capture when the first audio is received by the callback
+                    if self.first_audio_chunk_queued_time:
+                         print(f"[PERF] TTS Queue -> Audio Callback: {(time.perf_counter() - self.first_audio_chunk_queued_time) * 1000:.2f}ms", file=sys.stderr)
+                         self.first_audio_chunk_queued_time = None # Only print once
+                else:
+                    audio_chunk = item
+
+                if audio_chunk is None:
                     if len(self.callback_buffer) > 0:
                         outdata[:len(self.callback_buffer)] = self.callback_buffer.reshape(-1, 1); outdata[len(self.callback_buffer):] = 0
                         self.callback_buffer = np.array([], dtype=np.float32)
                     raise sd.CallbackStop
                 
-                if self.eot_time:
-                    print(f"[PERF] End-to-End Latency (User EOT to First Sound): {time.perf_counter() - self.eot_time:.4f}s", file=sys.stderr)
-                    self.eot_time = None
+                ### PERF MARKER ### - The final, ground-truth measurement
+                if self.initial_trigger_time:
+                    print(f"[PERF] ========================================================", file=sys.stderr)
+                    print(f"[PERF] TOTAL LATENCY (VAD Trigger to First Sound): {(time.perf_counter() - self.initial_trigger_time) * 1000:.2f}ms", file=sys.stderr)
+                    print(f"[PERF] ========================================================", file=sys.stderr)
+                    self.initial_trigger_time = None
 
-                self.callback_buffer = np.concatenate((self.callback_buffer, item))
+                self.callback_buffer = np.concatenate((self.callback_buffer, audio_chunk))
             except queue.Empty:
                 t_gap_start = time.perf_counter()
                 try:
                     item = self.audio_playback_queue.get(timeout=0.05)
+                    if isinstance(item, tuple): item = item[0] # Discard time for subsequent chunks
                     if item is None: raise sd.CallbackStop
                     self.callback_buffer = np.concatenate((self.callback_buffer, item))
-                    print(f"[PERF] Audio Pipeline Gap (waited for data): {time.perf_counter() - t_gap_start:.4f}s", file=sys.stderr)
+                    print(f"[PERF] Audio Pipeline Gap (waited for data): {(time.perf_counter() - t_gap_start) * 1000:.2f}ms", file=sys.stderr)
                 except queue.Empty: outdata.fill(0); return
         
         outdata[:] = self.callback_buffer[:chunk_size].reshape(-1, 1)
@@ -109,7 +129,12 @@ class TTSWorker:
                 item = self.llm_stream_queue.get(timeout=1)
                 if item is None: break
                 
-                iterator, dynamic_speed, self.eot_time = item['iterator'], item['speed'], item.get('eot_time')
+                ### PERF MARKER ###
+                t_tts_receives_item = time.perf_counter()
+                print(f"[PERF] LLM -> TTS Queue Handoff: {(t_tts_receives_item - item['t_llm_handoff']) * 1000:.2f}ms", file=sys.stderr)
+
+                iterator, dynamic_speed, self.initial_trigger_time = item['iterator'], item['speed'], item.get('initial_trigger_time')
+                
                 self.interruption_event.clear(); self.playback_complete_event.clear()
                 self.callback_buffer = np.array([], dtype=np.float32)
                 while not self.audio_playback_queue.empty(): self.audio_playback_queue.get_nowait()
@@ -121,11 +146,19 @@ class TTSWorker:
                                          callback=self._audio_callback,
                                          finished_callback=self.playback_complete_event.set)
                 stream.start()
-                print("[PERF] Audio stream started.", file=sys.stderr)
-
+                
+                ### PERF MARKER ###
+                t_tts_processing_first_token = None
+                
                 token_buffer = ""
                 for token in iterator:
                     if self.interruption_event.is_set(): break
+                    
+                    ### PERF MARKER ###
+                    if t_tts_processing_first_token is None:
+                        t_tts_processing_first_token = time.perf_counter()
+                        print(f"[PERF] LLM First Token -> TTS First Token Processing: {(t_tts_processing_first_token - item['t_first_token']) * 1000:.2f}ms", file=sys.stderr)
+
                     token_buffer += token
                     words, hard_stop_chars = token_buffer.split(), {'.', '?', '!', ':"'}
                     if any(c in token_buffer for c in hard_stop_chars) or (',' in token_buffer and len(words) > 12) or len(words) > 20:
@@ -138,7 +171,6 @@ class TTSWorker:
                 self.audio_playback_queue.put(None)
                 self.playback_complete_event.wait()
                 stream.close()
-                print("[PERF] Audio stream finished.", file=sys.stderr)
 
             except queue.Empty: continue
             except Exception as e: print(f"TTS Main Thread Error: {e}", file=sys.stderr)
@@ -154,11 +186,23 @@ class TTSWorker:
             t_start_tts = time.perf_counter()
             generator = self.pipeline(text, voice='af_heart', speed=speed)
             
+            first_chunk = True
             for i, (_, _, audio_chunk) in enumerate(generator):
                 if self.interruption_event.is_set(): return
-                trimmed_chunk = trim_silence(audio_chunk.cpu().numpy())
-                if trimmed_chunk.size > 0: self.audio_playback_queue.put(trimmed_chunk)
-            print(f"[PERF] TTS Fragment Synthesis Time: {time.perf_counter() - t_start_tts:.4f}s", file=sys.stderr)
+                
+                ### PERF MARKER ###
+                if first_chunk:
+                    print(f"[PERF] TTS First Chunk Synthesis Time: {(time.perf_counter() - t_start_tts) * 1000:.2f}ms", file=sys.stderr)
+                    self.first_audio_chunk_queued_time = time.perf_counter()
+                    # Pass the timestamp along with the first chunk
+                    item_to_queue = (trim_silence(audio_chunk.cpu().numpy()), self.first_audio_chunk_queued_time)
+                    first_chunk = False
+                else:
+                    item_to_queue = trim_silence(audio_chunk.cpu().numpy())
+
+                if np.any(item_to_queue[0]) if isinstance(item_to_queue, tuple) else np.any(item_to_queue):
+                     self.audio_playback_queue.put(item_to_queue)
+
         except Exception as e: print(f"[TTS] Generation error: {e}", file=sys.stderr)
 
 class LLMWorker:
@@ -177,7 +221,6 @@ class LLMWorker:
         self.tokenizer = self.processor.tokenizer
         if self.tokenizer.pad_token is None: self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # --- NEW: Simplified, robust prompt ---
         system_prompt = "You are a helpful, friendly, and eloquent conversational AI assistant. Keep your responses concise, natural, and accurate."
         self.conversation_turns = [{"role": "system", "content": system_prompt}]
         self._warmup()
@@ -201,9 +244,12 @@ class LLMWorker:
                 item = self.input_queue.get(timeout=1)
                 if item is None: break
 
-                audio_data, pause_duration, eot_time = item['audio'], item['pause_duration'], item['eot_time']
+                ### PERF MARKER ### - Renamed eot_time to be more generic
+                audio_data, pause_duration, initial_trigger_time = item['audio'], item['pause_duration'], item['trigger_time']
+                
                 t_llm_start = time.perf_counter()
-                print(f"\n[PERF] VAD EOT -> LLM Start: {t_llm_start - eot_time:.4f}s")
+                print(f"\n[PERF] --------------------------------------------------------", file=sys.stderr)
+                print(f"[PERF] VAD Trigger -> LLM Worker Start: {(t_llm_start - initial_trigger_time) * 1000:.2f}ms", file=sys.stderr)
                 print("[State] -> AI PROCESSING", file=sys.stderr)
                 
                 speed_factor = 1 - min(max(pause_duration, 0.5), 1.5) / 1.0
@@ -214,13 +260,22 @@ class LLMWorker:
                 
                 t_process_start = time.perf_counter()
                 inputs = self.processor(text=text_prompt, audios=[audio_data], sampling_rate=self.config.SAMPLE_RATE, return_tensors="pt").to(self.model.device)
-                print(f"[PERF] LLM Input Tensor Creation: {time.perf_counter() - t_process_start:.4f}s")
+                t_process_end = time.perf_counter()
+                print(f"[PERF] LLM Audio Pre-processing: {(t_process_end - t_process_start) * 1000:.2f}ms", file=sys.stderr)
                 
-                streamer, full_response_text_list, t_first_token = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True), [], None
+                streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                full_response_text_list = []
+                
+                ### PERF MARKER ### - We need to capture the time of the first token
+                t_first_token = None
+
                 def text_capturing_iterator(streamer_instance):
                     nonlocal t_first_token, full_response_text_list
                     for token in streamer_instance:
-                        if t_first_token is None: t_first_token = time.perf_counter()
+                        if t_first_token is None: 
+                            t_first_token = time.perf_counter()
+                            ### PERF MARKER ###
+                            print(f"[PERF] LLM Time To First Token (TTFT): {(t_first_token - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
                         full_response_text_list.append(token); yield token
                 
                 generation_kwargs = dict(**inputs, streamer=streamer, max_new_tokens=150, do_sample=True, temperature=0.7)
@@ -229,12 +284,87 @@ class LLMWorker:
                 llm_thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
                 llm_thread.start()
                 
-                self.tts_worker.play({'iterator': text_capturing_iterator(streamer), 'speed': dynamic_speed, 'eot_time': eot_time})
-                llm_thread.join()
-                t_end_generate = time.perf_counter()
-
-                if t_first_token: print(f"[PERF] LLM Time to First Token (TTFT): {t_first_token - t_start_generate:.4f}s")
+                ### PERF MARKER ### - Pass all necessary timestamps to the TTS worker
+                tts_payload = {
+                    'iterator': text_capturing_iterator(streamer), 
+                    'speed': dynamic_speed, 
+                    'initial_trigger_time': initial_trigger_time,
+                    't_first_token': t_first_token, # This will be None initially, but the closure will update it
+                    't_llm_handoff': time.perf_counter()
+                }
                 
+                # This is a bit tricky. We need t_first_token, but it's set in another thread.
+                # A better way is to pass a mutable object, like a list, or handle it in the iterator.
+                # For now, we pass the iterator and let the TTS worker handle the timing logic.
+                
+                # A refactor to make timing more robust
+                timing_data = {'t_first_token': None}
+
+                def text_capturing_iterator_with_timing(streamer_instance):
+                    nonlocal full_response_text_list
+                    for token in streamer_instance:
+                        if timing_data['t_first_token'] is None:
+                            timing_data['t_first_token'] = time.perf_counter()
+                            print(f"[PERF] LLM Time To First Token (TTFT): {(timing_data['t_first_token'] - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
+                        full_response_text_list.append(token)
+                        yield token
+                
+                tts_payload = {
+                    'iterator': text_capturing_iterator_with_timing(streamer),
+                    'speed': dynamic_speed,
+                    'initial_trigger_time': initial_trigger_time,
+                    'timing_data': timing_data,
+                    't_llm_handoff': time.perf_counter()
+                }
+
+                # self.tts_worker.play(tts_payload) # We need to update TTS worker to handle this new payload
+                
+                # Let's simplify and pass the time directly in the iterator itself
+                def text_capturing_iterator_final(streamer_instance):
+                    nonlocal t_first_token, full_response_text_list
+                    for token in streamer_instance:
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
+                            print(f"[PERF] LLM Time To First Token (TTFT): {(t_first_token - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
+                            # Yield the time as the very first item
+                            yield {'type': 'time', 'value': t_first_token}
+                        full_response_text_list.append(token)
+                        yield {'type': 'token', 'value': token}
+                
+                tts_payload_final = {
+                    'iterator': text_capturing_iterator_final(streamer),
+                    'speed': dynamic_speed,
+                    'initial_trigger_time': initial_trigger_time,
+                    't_llm_handoff': time.perf_counter()
+                }
+                # And update TTS worker to handle this dict-based iterator
+                
+                # Let's go with the simplest approach that works without major refactoring.
+                # We'll pass the whole item dict through, and update it from the iterator closure.
+                # This is slightly less clean but requires minimal changes.
+                
+                item_for_tts = {
+                    'iterator': None, # will be set below
+                    'speed': dynamic_speed,
+                    'initial_trigger_time': initial_trigger_time,
+                    't_first_token': None, # This will be set by the iterator
+                    't_llm_handoff': time.perf_counter()
+                }
+                
+                def final_iterator(streamer_instance):
+                    nonlocal full_response_text_list
+                    for token in streamer_instance:
+                        if item_for_tts['t_first_token'] is None:
+                            item_for_tts['t_first_token'] = time.perf_counter()
+                            print(f"[PERF] LLM Time To First Token (TTFT): {(item_for_tts['t_first_token'] - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
+                        full_response_text_list.append(token)
+                        yield token
+                
+                item_for_tts['iterator'] = final_iterator(streamer)
+
+                self.tts_worker.play(item_for_tts)
+                llm_thread.join()
+
                 final_text = "".join(full_response_text_list).strip()
                 self.conversation_turns.append({"role": "user", "content": "[user audio]"})
                 if final_text: self.conversation_turns.append({"role": "assistant", "content": final_text})
@@ -281,15 +411,16 @@ class AudioInputWorker:
                             current_silence_duration = time.perf_counter() - self.silence_start_time
 
                             if self.speculative_trigger_time is None and (current_silence_duration > self.config.SPECULATIVE_SILENCE_S):
-                                print(f"[VAD] Speculative trigger.", file=sys.stderr)
+                                print(f"[VAD] Speculative trigger after {current_silence_duration*1000:.2f}ms of silence.", file=sys.stderr)
                                 self.speculative_trigger_time = time.perf_counter()
-                                if self.audio_buffer: self.output_queue.put({'audio': np.concatenate(self.audio_buffer).flatten().copy(), 'pause_duration': 0.1, 'eot_time': self.speculative_trigger_time})
+                                if self.audio_buffer: self.output_queue.put({'audio': np.concatenate(self.audio_buffer).flatten().copy(), 'pause_duration': 0.1, 'trigger_time': self.speculative_trigger_time})
 
                             if current_silence_duration > self.config.END_OF_TURN_SILENCE_S:
                                 eot_time = time.perf_counter()
-                                print(f"[VAD] End of turn confirmed.", file=sys.stderr)
+                                print(f"[VAD] End of turn confirmed after {current_silence_duration*1000:.2f}ms of silence.", file=sys.stderr)
                                 if self.speculative_trigger_time is None and self.audio_buffer:
-                                    self.output_queue.put({'audio': np.concatenate(self.audio_buffer).flatten(), 'pause_duration': current_silence_duration, 'eot_time': eot_time})
+                                    # This is the non-speculative path
+                                    self.output_queue.put({'audio': np.concatenate(self.audio_buffer).flatten(), 'pause_duration': current_silence_duration, 'trigger_time': eot_time})
                                 self._reset_state()
                 except Exception as e: print(f"Audio input error: {e}", file=sys.stderr); self._reset_state()
 
@@ -306,6 +437,8 @@ if __name__ == "__main__":
     
     tts_worker.start(); llm_worker.start(); audio_input.start()
     time.sleep(2)
+    # Perform warm-up after threads have started
+    llm_worker._warmup()
     tts_worker._warmup()
 
     print("\n--- All Systems Ready ---"); print(">>> AGENT IS LISTENING. SPEAK NOW. (Ctrl+C to exit) <<<")
