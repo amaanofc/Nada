@@ -8,7 +8,6 @@ import time
 from transformers import AutoModel, AutoProcessor, AutoConfig, TextIteratorStreamer, BitsAndBytesConfig
 import queue
 from threading import Thread, Event
-import re
 import os
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -88,7 +87,7 @@ class TTSWorker:
             try:
                 item = self.audio_playback_queue.get_nowait()
                 if isinstance(item, tuple):
-                    audio_chunk, queued_time = item
+                    audio_chunk, _ = item
                     ### PERF MARKER ### - Capture when the first audio is received by the callback
                     if self.first_audio_chunk_queued_time:
                          print(f"[PERF] TTS Queue -> Audio Callback: {(time.perf_counter() - self.first_audio_chunk_queued_time) * 1000:.2f}ms", file=sys.stderr)
@@ -211,7 +210,6 @@ class LLMWorker:
         self.config, self.tts_worker, self.input_queue = config, tts_worker, queue.Queue()
         
         model_config = AutoConfig.from_pretrained(config.LLM_MODEL, trust_remote_code=True)
-        if hasattr(model_config, 'rope_scaling'): del model_config.rope_scaling
 
         self.model = AutoModel.from_pretrained(
             config.LLM_MODEL, config=model_config, torch_dtype=torch.float16, device_map="auto",
@@ -229,7 +227,7 @@ class LLMWorker:
     def _warmup(self):
         try:
             print("[LLM] Warming up engine...")
-            dummy_text = "User: <|audio|>"
+            dummy_text = "User: <|audio>"
             dummy_audio = np.zeros(self.config.SAMPLE_RATE, dtype=np.float32)
             inputs = self.processor(text=dummy_text, audios=[dummy_audio], sampling_rate=self.config.SAMPLE_RATE, return_tensors="pt").to(self.model.device)
             _ = self.model.generate(**inputs, max_new_tokens=5, do_sample=False)
@@ -263,108 +261,45 @@ class LLMWorker:
                 t_process_end = time.perf_counter()
                 print(f"[PERF] LLM Audio Pre-processing: {(t_process_end - t_process_start) * 1000:.2f}ms", file=sys.stderr)
                 
+                # --- Streaming Setup ---
                 streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
                 full_response_text_list = []
                 
-                ### PERF MARKER ### - We need to capture the time of the first token
-                t_first_token = None
-
-                def text_capturing_iterator(streamer_instance):
-                    nonlocal t_first_token, full_response_text_list
-                    for token in streamer_instance:
-                        if t_first_token is None: 
-                            t_first_token = time.perf_counter()
-                            ### PERF MARKER ###
-                            print(f"[PERF] LLM Time To First Token (TTFT): {(t_first_token - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
-                        full_response_text_list.append(token); yield token
-                
                 generation_kwargs = dict(**inputs, streamer=streamer, max_new_tokens=150, do_sample=True, temperature=0.7)
                 t_start_generate = time.perf_counter()
+
+                # This dictionary will be passed to the TTS worker.
+                # The iterator function below will modify it as a side effect.
+                tts_payload = {
+                    'iterator': None, # Will be set below
+                    'speed': dynamic_speed, 
+                    'initial_trigger_time': initial_trigger_time,
+                    't_first_token': None, # This will be populated by the iterator
+                    't_llm_handoff': time.perf_counter()
+                }
                 
+                # This iterator captures tokens for the full response text
+                # and updates the tts_payload with the first token's timestamp.
+                def text_capturing_iterator(streamer_instance):
+                    nonlocal full_response_text_list
+                    for token in streamer_instance:
+                        if tts_payload['t_first_token'] is None:
+                            tts_payload['t_first_token'] = time.perf_counter()
+                            print(f"[PERF] LLM Time To First Token (TTFT): {(tts_payload['t_first_token'] - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
+                        full_response_text_list.append(token)
+                        yield token
+                
+                tts_payload['iterator'] = text_capturing_iterator(streamer)
+
+                # --- Start Generation and Handoff to TTS ---
                 llm_thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
                 llm_thread.start()
                 
-                ### PERF MARKER ### - Pass all necessary timestamps to the TTS worker
-                tts_payload = {
-                    'iterator': text_capturing_iterator(streamer), 
-                    'speed': dynamic_speed, 
-                    'initial_trigger_time': initial_trigger_time,
-                    't_first_token': t_first_token, # This will be None initially, but the closure will update it
-                    't_llm_handoff': time.perf_counter()
-                }
+                self.tts_worker.play(tts_payload)
                 
-                # This is a bit tricky. We need t_first_token, but it's set in another thread.
-                # A better way is to pass a mutable object, like a list, or handle it in the iterator.
-                # For now, we pass the iterator and let the TTS worker handle the timing logic.
-                
-                # A refactor to make timing more robust
-                timing_data = {'t_first_token': None}
-
-                def text_capturing_iterator_with_timing(streamer_instance):
-                    nonlocal full_response_text_list
-                    for token in streamer_instance:
-                        if timing_data['t_first_token'] is None:
-                            timing_data['t_first_token'] = time.perf_counter()
-                            print(f"[PERF] LLM Time To First Token (TTFT): {(timing_data['t_first_token'] - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
-                        full_response_text_list.append(token)
-                        yield token
-                
-                tts_payload = {
-                    'iterator': text_capturing_iterator_with_timing(streamer),
-                    'speed': dynamic_speed,
-                    'initial_trigger_time': initial_trigger_time,
-                    'timing_data': timing_data,
-                    't_llm_handoff': time.perf_counter()
-                }
-
-                # self.tts_worker.play(tts_payload) # We need to update TTS worker to handle this new payload
-                
-                # Let's simplify and pass the time directly in the iterator itself
-                def text_capturing_iterator_final(streamer_instance):
-                    nonlocal t_first_token, full_response_text_list
-                    for token in streamer_instance:
-                        if t_first_token is None:
-                            t_first_token = time.perf_counter()
-                            print(f"[PERF] LLM Time To First Token (TTFT): {(t_first_token - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
-                            # Yield the time as the very first item
-                            yield {'type': 'time', 'value': t_first_token}
-                        full_response_text_list.append(token)
-                        yield {'type': 'token', 'value': token}
-                
-                tts_payload_final = {
-                    'iterator': text_capturing_iterator_final(streamer),
-                    'speed': dynamic_speed,
-                    'initial_trigger_time': initial_trigger_time,
-                    't_llm_handoff': time.perf_counter()
-                }
-                # And update TTS worker to handle this dict-based iterator
-                
-                # Let's go with the simplest approach that works without major refactoring.
-                # We'll pass the whole item dict through, and update it from the iterator closure.
-                # This is slightly less clean but requires minimal changes.
-                
-                item_for_tts = {
-                    'iterator': None, # will be set below
-                    'speed': dynamic_speed,
-                    'initial_trigger_time': initial_trigger_time,
-                    't_first_token': None, # This will be set by the iterator
-                    't_llm_handoff': time.perf_counter()
-                }
-                
-                def final_iterator(streamer_instance):
-                    nonlocal full_response_text_list
-                    for token in streamer_instance:
-                        if item_for_tts['t_first_token'] is None:
-                            item_for_tts['t_first_token'] = time.perf_counter()
-                            print(f"[PERF] LLM Time To First Token (TTFT): {(item_for_tts['t_first_token'] - t_start_generate) * 1000:.2f}ms", file=sys.stderr)
-                        full_response_text_list.append(token)
-                        yield token
-                
-                item_for_tts['iterator'] = final_iterator(streamer)
-
-                self.tts_worker.play(item_for_tts)
                 llm_thread.join()
 
+                # --- Finalize Conversation History ---
                 final_text = "".join(full_response_text_list).strip()
                 self.conversation_turns.append({"role": "user", "content": "[user audio]"})
                 if final_text: self.conversation_turns.append({"role": "assistant", "content": final_text})
